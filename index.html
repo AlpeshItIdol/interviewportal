@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <base href="/interviewportal/">
+  <base href="/">
   <meta charset="UTF-8">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
@@ -30,6 +30,517 @@
   <link rel="manifest" href="manifest.json">
 </head>
 <body style="background-color: #0F172A; margin: 0; padding: 0; overflow: hidden;">
+  <script>
+    window._proctoringStream = null;
+    window._proctoringAudioContext = null;
+    window._proctoringAnalyser = null;
+    window._proctoringDataArray = null;
+
+    function _setupAudioAnalyser(stream) {
+      try {
+        if (window._proctoringAudioContext) {
+          try { window._proctoringAudioContext.close(); } catch(_) {}
+        }
+        const audioTracks = stream.getAudioTracks();
+        if (!audioTracks || audioTracks.length === 0) return;
+
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextClass) return;
+
+        const ctx = new AudioContextClass();
+        if (ctx.state === 'suspended') {
+          ctx.resume().catch(function() {});
+        }
+        const source = ctx.createMediaStreamSource(stream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.4;
+        source.connect(analyser);
+
+        window._proctoringAudioContext = ctx;
+        window._proctoringAnalyser = analyser;
+        window._proctoringDataArray = new Uint8Array(analyser.frequencyBinCount);
+      } catch (err) {
+        console.warn('AudioAnalyser error:', err);
+      }
+    }
+
+    window.getProctoringAudioVolume = function() {
+      if (!window._proctoringAnalyser || !window._proctoringDataArray) {
+        return 0.0;
+      }
+      try {
+        if (window._proctoringAudioContext && window._proctoringAudioContext.state === 'suspended') {
+          window._proctoringAudioContext.resume().catch(function() {});
+        }
+        window._proctoringAnalyser.getByteFrequencyData(window._proctoringDataArray);
+        let sum = 0;
+        const len = window._proctoringDataArray.length;
+        for (let i = 0; i < len; i++) {
+          sum += window._proctoringDataArray[i];
+        }
+        const avg = sum / len; // 0 to 255
+        // Sensitivity boost for natural voice detection
+        const normalized = Math.min(1.0, (avg / 75.0));
+        return normalized;
+      } catch (_) {
+        return 0.0;
+      }
+    };
+
+    window.getProctoringMediaDevices = function(onResult) {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+        onResult(JSON.stringify({ cameras: [], microphones: [] }));
+        return;
+      }
+      navigator.mediaDevices.enumerateDevices().then(function(devices) {
+        const cameras = [];
+        const microphones = [];
+        let camCount = 0;
+        let micCount = 0;
+        devices.forEach(function(d) {
+          if (d.kind === 'videoinput') {
+            camCount++;
+            cameras.push({
+              id: d.deviceId,
+              label: d.label || ('Camera ' + camCount)
+            });
+          } else if (d.kind === 'audioinput') {
+            micCount++;
+            microphones.push({
+              id: d.deviceId,
+              label: d.label || ('Microphone ' + micCount)
+            });
+          }
+        });
+        onResult(JSON.stringify({ cameras: cameras, microphones: microphones }));
+      }).catch(function() {
+        onResult(JSON.stringify({ cameras: [], microphones: [] }));
+      });
+    };
+
+    window.initProctoringCamera = function(videoEl, onResult, preferredCamId, preferredMicId) {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        onResult(false, 'Camera API (navigator.mediaDevices) is not supported in this browser.');
+        return;
+      }
+
+      const videoConstraints = preferredCamId 
+        ? { deviceId: { exact: preferredCamId }, width: { ideal: 640 }, height: { ideal: 480 } }
+        : { width: { ideal: 640 }, height: { ideal: 480 } };
+
+      const audioConstraints = preferredMicId
+        ? { deviceId: { exact: preferredMicId } }
+        : true;
+
+      navigator.mediaDevices.getUserMedia({
+        video: videoConstraints,
+        audio: audioConstraints
+      })
+      .then(function(stream) {
+        _attachProctoringStream(stream, videoEl, onResult);
+      })
+      .catch(function(e1) {
+        navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+        .then(function(stream) {
+          _attachProctoringStream(stream, videoEl, onResult);
+        })
+        .catch(function(e2) {
+          navigator.mediaDevices.getUserMedia({ video: true })
+          .then(function(stream) {
+            _attachProctoringStream(stream, videoEl, onResult);
+          })
+          .catch(function(e3) {
+            const err = e3 ? (e3.name + ': ' + e3.message) : 'Permission denied';
+            onResult(false, err);
+          });
+        });
+      });
+    };
+
+    function _attachProctoringStream(stream, videoEl, onResult) {
+      window._proctoringStream = stream;
+      _setupAudioAnalyser(stream);
+      if (videoEl) {
+        videoEl.srcObject = stream;
+        videoEl.play().catch(function() {});
+      }
+      onResult(true, '');
+    }
+
+    window.switchProctoringDevice = function(videoEl, cameraDeviceId, micDeviceId, onResult) {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        onResult(false, 'Not supported');
+        return;
+      }
+
+      const videoConstraints = (cameraDeviceId && cameraDeviceId.length > 0)
+        ? { deviceId: { exact: cameraDeviceId }, width: { ideal: 640 }, height: { ideal: 480 } }
+        : true;
+
+      const audioConstraints = (micDeviceId && micDeviceId.length > 0)
+        ? { deviceId: { exact: micDeviceId } }
+        : true;
+
+      navigator.mediaDevices.getUserMedia({
+        video: videoConstraints,
+        audio: audioConstraints
+      }).then(function(newStream) {
+        if (window._proctoringStream) {
+          window._proctoringStream.getTracks().forEach(function(t) {
+            try { t.stop(); } catch(_) {}
+          });
+        }
+        window._proctoringStream = newStream;
+        _setupAudioAnalyser(newStream);
+        if (videoEl) {
+          videoEl.srcObject = newStream;
+          videoEl.play().catch(function() {});
+        }
+        onResult(true, '');
+      }).catch(function(err) {
+        onResult(false, err ? err.message : 'Switch failed');
+      });
+    };
+
+    window.stopProctoringCamera = function() {
+      if (window._proctoringAudioContext) {
+        try { window._proctoringAudioContext.close(); } catch(_) {}
+        window._proctoringAudioContext = null;
+        window._proctoringAnalyser = null;
+        window._proctoringDataArray = null;
+      }
+      if (window._proctoringStream) {
+        window._proctoringStream.getTracks().forEach(function(track) {
+          try { track.stop(); } catch (_) {}
+        });
+        window._proctoringStream = null;
+      }
+    };
+
+    window._speechRecognition = null;
+    window._isSpeechListening = false;
+    window._speechPreviousSegments = '';
+    window._speechCurrentSessionFinal = '';
+    window._speechCurrentSessionInterim = '';
+    window._mediaRecorder = null;
+    window._recordedAudioBlobs = [];
+    window._lastRecordedAudioBlob = null;
+    window._lastRecordedAudioUrl = '';
+    window._lastRecordedAudioDuration = 0;
+    window._recordingStartTime = 0;
+    window._activeAudioPlayer = null;
+
+    function _safeStatus(onStatus, status, error) {
+      try {
+        window.dispatchEvent(new CustomEvent('speech_status_event', {
+          detail: JSON.stringify({ status: status || '', error: error || '' })
+        }));
+      } catch(_) {}
+      if (typeof onStatus === 'function') {
+        try { onStatus(status || '', error || ''); } catch(_) {}
+      }
+    }
+
+    function _safeTranscription(onText, text) {
+      if (typeof text !== 'string') return;
+      try {
+        window.dispatchEvent(new CustomEvent('speech_transcription_event', { detail: text }));
+      } catch(_) {}
+      if (typeof onText === 'function') {
+        try { onText(text); } catch(_) {}
+      }
+    }
+
+    window.startNativeSpeechRecognition = function(onText, onStatus, initialText) {
+      const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+      window._isSpeechListening = true;
+      window._speechPreviousSegments = (typeof initialText === 'string' && initialText.trim().length > 0)
+        ? (initialText.trim() + ' ')
+        : '';
+      window._speechCurrentSessionFinal = '';
+      window._speechCurrentSessionInterim = '';
+      window._recordedAudioBlobs = [];
+      window._recordingStartTime = Date.now();
+      window._lastRecordedAudioBlob = null;
+      window._lastRecordedAudioDuration = 0;
+      window._lastRecordedAudioUrl = '';
+
+      // Start MediaRecorder for actual voice recording
+      function _startMediaRecorder(stream) {
+        try {
+          const audioTracks = stream.getAudioTracks();
+          if (!audioTracks || audioTracks.length === 0) return;
+          const audioStream = new MediaStream(audioTracks);
+          let options = {};
+          if (typeof MediaRecorder !== 'undefined') {
+            if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+              options = { mimeType: 'audio/webm;codecs=opus' };
+            } else if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/webm')) {
+              options = { mimeType: 'audio/webm' };
+            } else if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/mp4')) {
+              options = { mimeType: 'audio/mp4' };
+            } else if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/aac')) {
+              options = { mimeType: 'audio/aac' };
+            } else if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) {
+              options = { mimeType: 'audio/ogg;codecs=opus' };
+            }
+            window._mediaRecorder = new MediaRecorder(audioStream, options);
+            window._mediaRecorder.ondataavailable = function(e) {
+              if (e.data && e.data.size > 0) {
+                window._recordedAudioBlobs.push(e.data);
+              }
+            };
+            window._mediaRecorder.onstop = function() {
+              try {
+                const mime = (window._mediaRecorder && window._mediaRecorder.mimeType) ? window._mediaRecorder.mimeType : 'audio/webm';
+                const blob = new Blob(window._recordedAudioBlobs, { type: mime });
+                window._lastRecordedAudioBlob = blob;
+                const dur = Math.max(1, Math.round((Date.now() - (window._recordingStartTime || Date.now())) / 1000));
+                window._lastRecordedAudioDuration = dur;
+                const newUrl = URL.createObjectURL(blob);
+                window._lastRecordedAudioUrl = newUrl;
+                window._sessionAudioUrls = window._sessionAudioUrls || [];
+                window._sessionAudioUrls.push(newUrl);
+                try {
+                  window.dispatchEvent(new CustomEvent('recorded_audio_ready', {
+                    detail: JSON.stringify({
+                      hasAudio: true,
+                      duration: dur,
+                      size: blob.size,
+                      url: newUrl
+                    })
+                  }));
+                } catch(_) {}
+              } catch(recErr) {
+                console.warn('Audio blob assembly error:', recErr);
+              }
+            };
+            window._mediaRecorder.start(200);
+          }
+        } catch (e) {
+          console.warn('MediaRecorder start error:', e);
+        }
+      }
+
+      if (window._proctoringStream && window._proctoringStream.getAudioTracks().length > 0) {
+        _startMediaRecorder(window._proctoringStream);
+      } else if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        navigator.mediaDevices.getUserMedia({ audio: true }).then(function(audioStream) {
+          if (window._isSpeechListening) {
+            window._tempMicStream = audioStream;
+            _startMediaRecorder(audioStream);
+          } else {
+            audioStream.getTracks().forEach(function(t) { try { t.stop(); } catch(_) {} });
+          }
+        }).catch(function(err) {
+          console.warn('Audio stream access error:', err);
+        });
+      }
+
+      if (!SpeechRec) {
+        _safeStatus(onStatus, 'listening', '');
+        return true;
+      }
+
+      function _createAndStart() {
+        if (!window._isSpeechListening) return;
+
+        try {
+          if (window._speechRecognition) {
+            try { window._speechRecognition.abort(); } catch(_) {}
+          }
+
+          const recognition = new SpeechRec();
+          recognition.continuous = true;
+          recognition.interimResults = true;
+          recognition.lang = 'en-US';
+
+          recognition.onstart = function() {
+            _safeStatus(onStatus, 'listening', '');
+          };
+
+          recognition.onresult = function(event) {
+            let sessionFinal = '';
+            let sessionInterim = '';
+            for (let i = 0; i < event.results.length; ++i) {
+              if (event.results[i].isFinal) {
+                sessionFinal += event.results[i][0].transcript + ' ';
+              } else {
+                sessionInterim += event.results[i][0].transcript;
+              }
+            }
+            window._speechCurrentSessionFinal = sessionFinal;
+            window._speechCurrentSessionInterim = sessionInterim;
+
+            const currentFull = (window._speechPreviousSegments + window._speechCurrentSessionFinal + window._speechCurrentSessionInterim).trim();
+            if (currentFull.length > 0) {
+              _safeTranscription(onText, currentFull);
+            }
+          };
+
+          recognition.onerror = function(event) {
+            console.warn('SpeechRecognition error:', event.error);
+            if (event.error === 'not-allowed') {
+              window._isSpeechListening = false;
+              _safeStatus(onStatus, 'error', 'Microphone permission was denied for speech recognition.');
+            } else if (event.error === 'network') {
+              _safeStatus(onStatus, 'warning', 'Speech recognition network service unavailable. Audio is still recorded.');
+            }
+          };
+
+          recognition.onend = function() {
+            // Preserve final and interim speech segments before restart so spoken words are never lost
+            if (window._speechCurrentSessionFinal) {
+              window._speechPreviousSegments += window._speechCurrentSessionFinal;
+              window._speechCurrentSessionFinal = '';
+            } else if (window._speechCurrentSessionInterim) {
+              window._speechPreviousSegments += window._speechCurrentSessionInterim + ' ';
+              window._speechCurrentSessionInterim = '';
+            }
+
+            if (window._isSpeechListening) {
+              try {
+                setTimeout(function() {
+                  if (window._isSpeechListening) {
+                    _createAndStart();
+                  }
+                }, 200);
+              } catch(_) {}
+            } else {
+              _safeStatus(onStatus, 'stopped', '');
+            }
+          };
+
+          window._speechRecognition = recognition;
+          recognition.start();
+        } catch (err) {
+          console.warn('SpeechRecognition start error:', err);
+        }
+      }
+
+      _createAndStart();
+      return true;
+    };
+
+    window.stopNativeSpeechRecognition = function() {
+      window._isSpeechListening = false;
+
+      // Merge current interim/final spoken words so nothing is lost
+      if (window._speechCurrentSessionFinal) {
+        window._speechPreviousSegments += window._speechCurrentSessionFinal;
+        window._speechCurrentSessionFinal = '';
+      }
+      if (window._speechCurrentSessionInterim) {
+        window._speechPreviousSegments += window._speechCurrentSessionInterim + ' ';
+        window._speechCurrentSessionInterim = '';
+      }
+
+      if (window._speechRecognition) {
+        try {
+          window._speechRecognition.stop();
+        } catch(_) {}
+        window._speechRecognition = null;
+      }
+
+      if (window._mediaRecorder && window._mediaRecorder.state !== 'inactive') {
+        try {
+          if (typeof window._mediaRecorder.requestData === 'function') {
+            window._mediaRecorder.requestData();
+          }
+          window._mediaRecorder.stop();
+        } catch(_) {}
+      }
+
+      if (window._tempMicStream) {
+        try {
+          window._tempMicStream.getTracks().forEach(function(t) { try { t.stop(); } catch(_) {} });
+        } catch(_) {}
+        window._tempMicStream = null;
+      }
+
+      const full = (window._speechPreviousSegments).trim();
+      _safeTranscription(null, full);
+      _safeStatus(null, 'stopped', '');
+      return full;
+    };
+
+    window.getRecordedAudioInfo = function() {
+      return JSON.stringify({
+        hasAudio: !!(window._lastRecordedAudioBlob && window._lastRecordedAudioBlob.size > 0),
+        duration: window._lastRecordedAudioDuration || 0,
+        size: window._lastRecordedAudioBlob ? window._lastRecordedAudioBlob.size : 0,
+        url: window._lastRecordedAudioUrl || '',
+        mimeType: (window._lastRecordedAudioBlob && window._lastRecordedAudioBlob.type) ? window._lastRecordedAudioBlob.type : 'audio/webm'
+      });
+    };
+
+    window.getRecordedAudioBase64 = function(callback) {
+      if (!window._lastRecordedAudioBlob || window._lastRecordedAudioBlob.size === 0) {
+        if (typeof callback === 'function') callback('');
+        return;
+      }
+      const reader = new FileReader();
+      reader.onloadend = function() {
+        const base64data = reader.result ? reader.result.toString().split(',')[1] : '';
+        if (typeof callback === 'function') callback(base64data || '');
+      };
+      reader.onerror = function() {
+        if (typeof callback === 'function') callback('');
+      };
+      reader.readAsDataURL(window._lastRecordedAudioBlob);
+    };
+
+    window.getRecordedAudioMimeType = function() {
+      if (window._lastRecordedAudioBlob && window._lastRecordedAudioBlob.type) {
+        return window._lastRecordedAudioBlob.type;
+      }
+      return 'audio/webm';
+    };
+
+    window.playRecordedAudio = function(customUrl) {
+      const urlToPlay = (typeof customUrl === 'string' && customUrl.length > 0) ? customUrl : window._lastRecordedAudioUrl;
+      if (!urlToPlay) return false;
+      try {
+        if (window._activeAudioPlayer) {
+          try { window._activeAudioPlayer.pause(); } catch(_) {}
+          window._activeAudioPlayer = null;
+        }
+        const audio = new Audio(urlToPlay);
+        window._activeAudioPlayer = audio;
+        audio.onended = function() {
+          window._activeAudioPlayer = null;
+          try {
+            window.dispatchEvent(new CustomEvent('recorded_audio_playback_ended', { detail: urlToPlay }));
+          } catch(_) {}
+        };
+        audio.play();
+        return true;
+      } catch (e) {
+        console.warn('Playback error:', e);
+        return false;
+      }
+    };
+
+    window.stopRecordedAudioPlayback = function() {
+      if (window._activeAudioPlayer) {
+        try { window._activeAudioPlayer.pause(); } catch(_) {}
+        window._activeAudioPlayer = null;
+        return true;
+      }
+      return false;
+    };
+
+    window.cleanupSessionAudioUrls = function() {
+      if (window._sessionAudioUrls && window._sessionAudioUrls.length > 0) {
+        window._sessionAudioUrls.forEach(function(u) {
+          try { URL.revokeObjectURL(u); } catch(_) {}
+        });
+        window._sessionAudioUrls = [];
+      }
+    };
+  </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>
